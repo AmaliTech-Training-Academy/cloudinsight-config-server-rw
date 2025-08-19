@@ -1,2 +1,6 @@
 # cloudinsight-config-server-rw
-CloudInsight project repository - cloudinsight-config-server-rw (backend)
+
+This is the cloudinsight-config-server-rw infrastructure repository.
+
+## Description
+Infrastructure component for the CloudInsight platform.
