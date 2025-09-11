@@ -84,10 +84,28 @@ fi
 echo "Available environment variables:"
 env | grep -E "(SPRING|CONFIG|GIT|MANAGEMENT)" | sort
 
+# Check temporary directory permissions
+echo "Checking temporary directory for JGit..."
+if [ -d "/tmp/jgit" ]; then
+  echo "  /tmp/jgit exists"
+  if [ -w "/tmp/jgit" ]; then
+    echo "  /tmp/jgit is writable"
+  else
+    echo "  WARNING: /tmp/jgit is not writable, attempting to fix permissions"
+    mkdir -p "/tmp/jgit" 2>/dev/null || echo "  Failed to create /tmp/jgit"
+    chmod 777 "/tmp/jgit" 2>/dev/null || echo "  Failed to set permissions on /tmp/jgit"
+  fi
+else
+  echo "  Creating /tmp/jgit directory"
+  mkdir -p "/tmp/jgit" 2>/dev/null && chmod 777 "/tmp/jgit" 2>/dev/null
+  echo "  Temporary directory status: $([ -d "/tmp/jgit" ] && [ -w "/tmp/jgit" ] && echo "OK" || echo "Failed")"
+fi
+
 # Check if running in Kubernetes
 if [ ! -z "$KUBERNETES_SERVICE_HOST" ]; then
   echo "=== Kubernetes Environment Detected ==="
   echo "Pod name: $HOSTNAME"
+  echo "Home directory: $HOME"
   echo "Mounted secrets path exists: $([ -d "/mnt/secrets" ] && echo "Yes" || echo "No")"
 fi
 

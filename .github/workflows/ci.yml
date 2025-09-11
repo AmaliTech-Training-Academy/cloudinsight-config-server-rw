@@ -1,0 +1,431 @@
+---
+name: Backend CI with Docker Multi-Platform Build and Deployment
+
+permissions:
+  contents: write
+  checks: write
+  actions: read
+  id-token: write
+
+concurrency:
+  group: backend-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  # Trigger on all branches for push events (commits)
+  push:
+    branches: ["*"]
+
+  # Trigger on pull requests to any branch
+  pull_request:
+    branches: ["*"]
+
+  # Trigger on merge events (when PR is merged)
+  merge_group:
+
+jobs:
+  backend-ci:
+    name: Backend CI Pipeline with Docker Build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for Java source files
+        id: check-java
+        run: |
+          # Check if there are any Java files in the repository
+          JAVA_FILES=$(find . -name "*.java" -type f | head -5)
+
+          if [ -z "$JAVA_FILES" ]; then
+            echo "⚠️ No Java source files found in repository"
+            echo "✅ Skipping Java build steps - repository not yet initialized with Java code"
+            echo "has_java=false" >> $GITHUB_OUTPUT
+          else
+            echo "☕ Java source files found:"
+            echo "$JAVA_FILES"
+            echo "✅ Proceeding with Java build pipeline"
+            echo "has_java=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Early success for non-Java repositories
+        if: steps.check-java.outputs.has_java == 'false'
+        run: |
+          echo "🎉 CI passed successfully!"
+          echo "✅ Repository validated (no Java code found - this is expected for new repositories)"
+          echo "✅ Ready for Java development"
+          exit 0
+
+      - name: Set up JDK 21
+        if: steps.check-java.outputs.has_java == 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "21"
+          cache: "maven"
+
+      - name: Run unit tests with JaCoCo (no packaging)
+        if: steps.check-java.outputs.has_java == 'true'
+        run: |
+          set -e
+          # Run tests + generate JaCoCo report without modifying pom.xml by invoking plugin directly
+          mvn -B -q org.jacoco:jacoco-maven-plugin:prepare-agent test org.jacoco:jacoco-maven-plugin:report
+          # Ensure report exists
+          if [ ! -f target/site/jacoco/jacoco.xml ]; then echo "JaCoCo report missing"; exit 1; fi
+
+      - name: Upload backend test artifacts
+        if: ${{ always() && steps.check-java.outputs.has_java == 'true' }}
+        run: |
+          set -e
+          mkdir -p ci-artifacts/backend
+          if ls target/surefire-reports/*.xml >/dev/null 2>&1; then cp target/surefire-reports/*.xml ci-artifacts/backend/; fi
+          [ -f target/site/jacoco/jacoco.xml ] && cp target/site/jacoco/jacoco.xml ci-artifacts/backend/
+          if [ -d target/site/jacoco ]; then tar -czf ci-artifacts/backend/jacoco-html.tar.gz -C target/site jacoco; fi
+
+      - name: Store backend artifacts
+        if: ${{ always() && steps.check-java.outputs.has_java == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-test-and-coverage
+          path: ci-artifacts/backend
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Annotate backend test results
+        if: ${{ always() && steps.check-java.outputs.has_java == 'true' }}
+        uses: dorny/test-reporter@v1
+        with:
+          name: Backend Tests
+          path: target/surefire-reports/*.xml
+          reporter: java-junit
+          fail-on-error: false
+
+      - name: Backend coverage summary
+        if: ${{ always() && steps.check-java.outputs.has_java == 'true' }}
+        run: |
+          echo "## Backend Test Summary" >> $GITHUB_STEP_SUMMARY
+          if ls target/surefire-reports/*.xml >/dev/null 2>&1; then
+            TOTAL=$(grep -h '<testsuite' target/surefire-reports/*.xml | awk -F'tests="' '{print $2}' | cut -d '"' -f1 | awk '{s+=$1} END {print s+0}')
+            FAIL=$(grep -h '<testsuite' target/surefire-reports/*.xml | awk -F'failures="' '{print $2}' | cut -d '"' -f1 | awk '{s+=$1} END {print s+0}')
+            echo "Tests: $TOTAL, Failures: $FAIL" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "No surefire XML reports" >> $GITHUB_STEP_SUMMARY
+          fi
+          if [ -f target/site/jacoco/jacoco.xml ]; then
+            LINE_COVERED=$(grep '<counter type="LINE"' target/site/jacoco/jacoco.xml | head -1 | sed -E 's/.*covered="([0-9]+)".*$/\1/')
+            LINE_MISSED=$(grep '<counter type="LINE"' target/site/jacoco/jacoco.xml | head -1 | sed -E 's/.*missed="([0-9]+)".*$/\1/')
+            TOTAL=$((LINE_COVERED + LINE_MISSED))
+            if [ "$TOTAL" -gt 0 ]; then PCT=$(awk -v c=$LINE_COVERED -v t=$TOTAL 'BEGIN{printf("%.2f", (c/t)*100)}'); else PCT=0; fi
+            echo "Coverage (lines): $PCT% ($LINE_COVERED/$TOTAL)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "No jacoco.xml" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Decrypt environment variables (post-tests, optional)
+        if: steps.check-java.outputs.has_java == 'true'
+        id: decrypt-env
+        run: |
+          echo "🔍 Checking for encrypted environment files (after tests)..."
+          cleanup() { rm -f ./team-private-key.pem ./temp-aes-key; }
+          trap cleanup EXIT
+          ENCRYPTED_DATA=$(find . -maxdepth 1 -name "encrypted-env-vars.enc" -type f | head -1)
+          ENCRYPTED_KEY=$(find . -maxdepth 1 -name "encrypted-aes-key.enc" -type f | head -1)
+          if [[ -z "$ENCRYPTED_DATA" || -z "$ENCRYPTED_KEY" ]]; then
+            echo "ℹ️ No encrypted env files found - skipping deployment"
+            echo "has_encrypted_env=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          echo "${{ secrets.TEAM_PRIVATE_KEY }}" > ./team-private-key.pem; chmod 600 ./team-private-key.pem
+          openssl rsautl -decrypt -inkey ./team-private-key.pem -in "$ENCRYPTED_KEY" -out ./temp-aes-key
+          AES_KEY=$(cat ./temp-aes-key)
+          if ! openssl enc -aes-256-gcm -d -in "$ENCRYPTED_DATA" -out "./.env" -pass "pass:$AES_KEY" 2>/dev/null; then
+            openssl enc -aes-256-cbc -d -in "$ENCRYPTED_DATA" -out "./.env" -pass "pass:$AES_KEY" 2>/dev/null || { echo "❌ Decrypt failed"; exit 1; }
+          fi
+          if [[ -f ./.env ]]; then
+            echo "✅ Environment variables decrypted successfully"
+            grep -q '^\.env$' .gitignore 2>/dev/null || echo ".env" >> .gitignore
+            git add .gitignore 2>/dev/null || true
+            echo "has_encrypted_env=true" >> $GITHUB_OUTPUT
+          else
+            echo "❌ Failed to create .env file"
+            echo "has_encrypted_env=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+      - name: Configure AWS credentials
+        if: steps.check-java.outputs.has_java == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Deploy environment variables to AWS Secrets Manager
+        if: steps.decrypt-env.outputs.has_encrypted_env == 'true'
+        run: |
+          echo "🚀 Deploying environment variables to AWS Secrets Manager..."
+          
+          # Verify .env file exists
+          if [[ ! -f ./.env ]]; then
+            echo "❌ .env file not found! This should not happen if decryption succeeded."
+            exit 1
+          fi
+          
+          SECRET_NAME="${{ secrets.AWS_SECRET_NAME_BACKEND }}"
+          if [[ -z "$SECRET_NAME" ]]; then
+            echo "❌ AWS_SECRET_NAME_BACKEND secret not configured"
+            exit 1
+          fi
+          
+          # Check if secret exists
+          if aws secretsmanager describe-secret --secret-id "$SECRET_NAME" >/dev/null 2>&1; then
+            echo "✅ Secret exists, updating with merge strategy..."
+            
+            # Get existing secret
+            EXISTING_SECRET=$(aws secretsmanager get-secret-value --secret-id "$SECRET_NAME" --query SecretString --output text)
+            
+            # Create temporary files for merging
+            echo "$EXISTING_SECRET" > /tmp/existing.json
+            
+            # Convert .env to JSON, preserving existing values not in .env
+            python3 << 'EOF'
+          import json
+          import os
+          
+          # Load existing secret
+          with open('/tmp/existing.json', 'r') as f:
+              content = f.read().strip()
+              existing = json.loads(content) if content else {}
+          
+          # Load new env vars
+          new_vars = {}
+          with open('.env', 'r') as f:
+              for line in f:
+                  line = line.strip()
+                  if line and not line.startswith('#') and '=' in line:
+                      key, value = line.split('=', 1)
+                      new_vars[key] = value
+          
+          # Merge with existing (new values override)
+          existing.update(new_vars)
+          
+          # Save merged result
+          with open('/tmp/merged.json', 'w') as f:
+              json.dump(existing, f)
+          EOF
+            
+            # Update secret with merged values
+            aws secretsmanager update-secret \
+              --secret-id "$SECRET_NAME" \
+              --secret-string file:///tmp/merged.json
+            
+            echo "✅ Secret updated successfully with merge strategy"
+          else
+            echo "🆕 Creating new secret..."
+            
+            # Convert .env to JSON
+            python3 << 'EOF'
+          import json
+          
+          env_vars = {}
+          with open('.env', 'r') as f:
+              for line in f:
+                  line = line.strip()
+                  if line and not line.startswith('#') and '=' in line:
+                      key, value = line.split('=', 1)
+                      env_vars[key] = value
+          
+          with open('/tmp/new.json', 'w') as f:
+              json.dump(env_vars, f)
+          EOF
+            
+            # Create new secret
+            aws secretsmanager create-secret \
+              --name "$SECRET_NAME" \
+              --description "Backend environment variables for ${{ github.repository }}" \
+              --secret-string file:///tmp/new.json
+            
+            echo "✅ Secret created successfully"
+          fi
+          
+          # Cleanup
+          rm -f /tmp/existing.json /tmp/merged.json /tmp/new.json
+          
+          echo "🔐 Environment variables deployed to AWS Secrets Manager: $SECRET_NAME"      - name: Login to Amazon ECR
+        if: steps.check-java.outputs.has_java == 'true'
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Calculate next semantic version
+        if: steps.check-java.outputs.has_java == 'true'
+        id: semver
+        run: |
+          echo "🏷️ Calculating next semantic version for branch: ${{ github.ref_name }}"
+          BRANCH_NAME="${{ github.ref_name }}"
+
+          # Get the latest tag from the current branch with branch suffix
+          LATEST_TAG=$(git tag -l --sort=-version:refname "v*-${BRANCH_NAME}" | head -1 || echo "")
+          
+          if [[ -z "$LATEST_TAG" ]]; then
+            # If no branch-specific tag, look for any v* tag for this branch's starting point
+            LATEST_TAG=$(git describe --tags --abbrev=0 --match="v*" 2>/dev/null || echo "v0.0.0")
+            # Remove any branch suffix if it exists
+            LATEST_TAG=$(echo "$LATEST_TAG" | sed 's/-[^-]*$//')
+          else
+            # Remove the branch suffix to get the version number
+            LATEST_TAG=$(echo "$LATEST_TAG" | sed 's/-[^-]*$//')
+          fi
+          
+          echo "Latest tag found: $LATEST_TAG"
+
+          # Extract version numbers
+          if [[ $LATEST_TAG =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            MAJOR=${BASH_REMATCH[1]}
+            MINOR=${BASH_REMATCH[2]}
+            PATCH=${BASH_REMATCH[3]}
+          else
+            echo "Invalid or no semantic version tag found, starting from v0.0.0"
+            MAJOR=0
+            MINOR=0
+            PATCH=0
+          fi
+
+          # Increment patch version
+          PATCH=$((PATCH + 1))
+          NEXT_VERSION="v${MAJOR}.${MINOR}.${PATCH}"
+
+          echo "Next version: $NEXT_VERSION"
+          echo "version=$NEXT_VERSION" >> $GITHUB_OUTPUT
+          echo "version_no_v=${MAJOR}.${MINOR}.${PATCH}" >> $GITHUB_OUTPUT
+
+      - name: Set up Docker Buildx
+        if: steps.check-java.outputs.has_java == 'true'
+        uses: docker/setup-buildx-action@v3
+        with:
+          platforms: linux/amd64,linux/arm64
+
+      - name: Check for pom.xml
+        if: steps.check-java.outputs.has_java == 'true'
+        run: |
+          if [ ! -f pom.xml ]; then
+            echo "❌ pom.xml not found - Maven project required"
+            exit 1
+          fi
+          echo "✅ Maven pom.xml found"
+
+      - name: Validate Maven project structure
+        if: steps.check-java.outputs.has_java == 'true'
+        run: |
+          # Check for src directory structure
+          if [ ! -d "src/main/java" ]; then
+            echo "❌ src/main/java directory not found"
+            exit 1
+          fi
+          echo "✅ Maven project structure validated"
+
+      - name: Check for Spring Boot application
+        if: steps.check-java.outputs.has_java == 'true'
+        run: |
+          # Look for Spring Boot indicators
+          if grep -q "spring-boot" pom.xml; then
+            echo "✅ Spring Boot project detected"
+          else
+            echo "⚠️ Spring Boot dependencies not found in pom.xml"
+          fi
+
+      - name: Build and push multi-platform Docker image to ECR
+        if: steps.check-java.outputs.has_java == 'true'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ secrets.ECR_REGISTRY }}/cloudinsight-backend:${{ steps.semver.outputs.version }}
+            ${{ secrets.ECR_REGISTRY }}/cloudinsight-backend:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            BUILDPLATFORM=linux/amd64
+            TARGETPLATFORM=linux/amd64
+
+      - name: Create and push git tag
+        if: steps.check-java.outputs.has_java == 'true' && github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/development' || github.ref == 'refs/heads/staging' || github.ref == 'refs/heads/production')
+        run: |
+          # Extract branch name for tag prefix
+          BRANCH_NAME="${{ github.ref_name }}"
+          echo "🏷️ Creating and pushing git tag for branch: $BRANCH_NAME"
+          echo "📝 Version: ${{ steps.semver.outputs.version }}"
+
+          # Configure git with GitHub token
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          
+          # Create branch-specific tag
+          TAG_NAME="${{ steps.semver.outputs.version }}-${BRANCH_NAME}"
+          
+          # Check if tag already exists
+          if git tag -l "$TAG_NAME" | grep -q "$TAG_NAME"; then
+            echo "⚠️ Tag $TAG_NAME already exists, skipping"
+            exit 0
+          fi
+
+          # Create annotated tag with branch info
+          git tag -a "$TAG_NAME" -m "Backend release ${{ steps.semver.outputs.version }} from branch $BRANCH_NAME"
+
+          # Push tag with authentication
+          git push https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git "$TAG_NAME"
+
+          echo "✅ Tag $TAG_NAME created and pushed successfully"
+
+      - name: Validate application properties
+        if: steps.check-java.outputs.has_java == 'true'
+        run: |
+          # Check for application configuration
+          if [ -f "src/main/resources/application.properties" ] || [ -f "src/main/resources/application.yml" ] || [ -f "src/main/resources/application.yaml" ]; then
+            echo "✅ Application configuration found"
+          else
+            echo "⚠️ No application.properties/yml found (using Spring Boot defaults)"
+          fi
+
+      - name: Check for tests
+        if: steps.check-java.outputs.has_java == 'true'
+        run: |
+          # Check if there are any test files
+          TEST_FILES=$(find src/test -name "*.java" -type f 2>/dev/null | head -5)
+
+          if [ -z "$TEST_FILES" ]; then
+            echo "⚠️ No test files found in src/test"
+          else
+            echo "✅ Test files found:"
+            echo "$TEST_FILES"
+          fi
+
+      - name: Final validation
+        if: steps.check-java.outputs.has_java == 'true'
+        run: |
+          echo "🎉 All CI checks passed successfully!"
+          echo "✅ Java project structure validated"
+          echo "✅ Tests executed prior to Docker build"
+          echo "✅ Multi-platform Docker image built and pushed to ECR"
+          if [[ "${{ steps.decrypt-env.outputs.has_encrypted_env }}" == "true" ]]; then
+            echo "✅ Environment variables deployed to AWS Secrets Manager"
+          fi
+          if [[ "${{ github.event_name }}" == "push" && ("${{ github.ref }}" == "refs/heads/main" || "${{ github.ref }}" == "refs/heads/development" || "${{ github.ref }}" == "refs/heads/staging" || "${{ github.ref }}" == "refs/heads/production") ]]; then
+            echo "✅ Git tag ${{ steps.semver.outputs.version }}-${{ github.ref_name }} created and pushed"
+          fi
+          if [ -f target/site/jacoco/jacoco.xml ]; then
+            LINE_COVERED=$(grep '<counter type="LINE"' target/site/jacoco/jacoco.xml | head -1 | sed -E 's/.*covered="([0-9]+)".*$/\1/')
+            LINE_MISSED=$(grep '<counter type="LINE"' target/site/jacoco/jacoco.xml | head -1 | sed -E 's/.*missed="([0-9]+)".*$/\1/')
+            TOTAL=$((LINE_COVERED + LINE_MISSED))
+            if [ "$TOTAL" -gt 0 ]; then PCT=$(awk -v c=$LINE_COVERED -v t=$TOTAL 'BEGIN{printf("%.2f", (c/t)*100)}'); else PCT=0; fi
+            echo "📊 Line coverage: $PCT% ($LINE_COVERED/$TOTAL)"; else echo "📊 Line coverage: n/a"; fi
+          echo "🚀 Backend successfully deployed and ready for use"
+
+      - name: Cleanup sensitive files
+        if: always() && steps.decrypt-env.outputs.has_encrypted_env == 'true'
+        run: |
+          echo "🧹 Cleaning up sensitive files..."
+          rm -f ./.env ./team-private-key.pem ./temp-aes-key
+          echo "✅ Cleanup completed"
