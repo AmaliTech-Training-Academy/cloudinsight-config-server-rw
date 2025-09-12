@@ -253,7 +253,9 @@ jobs:
           # Cleanup
           rm -f /tmp/existing.json /tmp/merged.json /tmp/new.json
           
-          echo "🔐 Environment variables deployed to AWS Secrets Manager: $SECRET_NAME"      - name: Login to Amazon ECR
+          echo "🔐 Environment variables deployed to AWS Secrets Manager: $SECRET_NAME"
+
+      - name: Login to Amazon ECR
         if: steps.check-java.outputs.has_java == 'true'
         uses: aws-actions/amazon-ecr-login@v2
 
