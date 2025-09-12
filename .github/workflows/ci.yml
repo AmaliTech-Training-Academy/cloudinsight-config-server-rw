@@ -107,28 +107,41 @@ jobs:
           echo "🚫 Removing database secrets (DB_PASSWORD, DB_URL, DB_USERNAME) from environment variables..."
           sed -i '/^DB_PASSWORD=/d; /^DB_URL=/d; /^DB_USERNAME=/d' .env
 
-          # Convert .env to JSON
-          echo "{" > /tmp/new.json
+          echo "📊 Remaining environment variables after database secret exclusion:"
+          grep -c "^[^#].*=" .env || echo "0"
+
+          # Create JSON using jq to properly escape all characters
+          echo "{}" > /tmp/new.json
           while IFS='=' read -r key value || [ -n "$key" ]; do
-            if [[ -z "$key" || "$key" =~ ^[[:space:]]*# ]]; then continue; fi
+            # Skip empty lines and comment lines
+            if [[ -z "$key" || "$key" =~ ^[[:space:]]*# ]]; then
+              continue
+            fi
+            
+            # Remove inline comments from value (everything after # including the #)
             value=$(echo "$value" | sed 's/[[:space:]]*#.*$//')
+            
             if [[ -n "$key" && -n "$value" ]]; then
-              escaped_value=$(echo "$value" | sed 's/"/\\"/g')
-              echo "  \"$key\": \"$escaped_value\"," >> /tmp/new.json
+              # Use jq to properly escape the value and add to JSON
+              jq --arg k "$key" --arg v "$value" '. + {($k): $v}' /tmp/new.json > /tmp/temp.json && mv /tmp/temp.json /tmp/new.json
             fi
           done < .env
-          sed -i '$ s/,$//' /tmp/new.json
-          echo "}" >> /tmp/new.json
 
           # Update or create secret
           if aws secretsmanager describe-secret --secret-id "$SECRET_NAME" >/dev/null 2>&1; then
+            echo "✅ Secret exists, updating..."
             aws secretsmanager update-secret --secret-id "$SECRET_NAME" --secret-string file:///tmp/new.json
+            echo "✅ Secret updated successfully"
           else
+            echo "🆕 Creating new secret..."
             aws secretsmanager create-secret --name "$SECRET_NAME" --description "Backend environment variables for ${{ github.repository }}" --secret-string file:///tmp/new.json
+            echo "✅ Secret created successfully"
           fi
-          rm -f /tmp/new.json
 
-      - name: Login to Amazon ECR
+          # Cleanup
+          rm -f /tmp/new.json
+          echo "🔐 Environment variables deployed to AWS Secrets Manager: $SECRET_NAME"
+          echo "🚫 Database secrets (DB_PASSWORD, DB_URL, DB_USERNAME) excluded from deployment"      - name: Login to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
 
       - name: Calculate next semantic version
