@@ -1,51 +1,17 @@
-name: Backend Services CI (No Tests)
+name: Backend Service CI (No Tests)
 
 on:
   push:
-    branches: [main, develop]
-    paths:
-      - "config-server/**"
-      - "service-discovery/**"
-      - "api-gateway/**"
+    branches: [main]
   pull_request:
-    branches: [main, develop]
-    paths:
-      - "config-server/**"
-      - "service-discovery/**"
-      - "api-gateway/**"
+    branches: [main]
 
 env:
   REGISTRY: ghcr.io
   IMAGE_PREFIX: cloudinsight
 
 jobs:
-  detect-changes:
-    runs-on: ubuntu-latest
-    outputs:
-      config-server: ${{ steps.changes.outputs.config-server }}
-      service-discovery: ${{ steps.changes.outputs.service-discovery }}
-      api-gateway: ${{ steps.changes.outputs.api-gateway }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Detect changes
-        uses: dorny/paths-filter@v3
-        id: changes
-        with:
-          filters: |
-            config-server:
-              - 'config-server/**'
-            service-discovery:
-              - 'service-discovery/**'
-            api-gateway:
-              - 'api-gateway/**'
-
-  build-config-server:
-    needs: detect-changes
-    if: needs.detect-changes.outputs.config-server == 'true'
+  build:
     runs-on: ubuntu-latest
 
     steps:
@@ -63,24 +29,29 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.m2
-          key: ${{ runner.os }}-maven-config-server-${{ hashFiles('config-server/**/pom.xml') }}
+          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
           restore-keys: |
-            ${{ runner.os }}-maven-config-server-
             ${{ runner.os }}-maven-
 
       - name: Build with Maven
-        working-directory: ./config-server
         run: |
           mvn clean compile -DskipTests=true \
             -Dmaven.javadoc.skip=true \
             -B -V
 
       - name: Package application
-        working-directory: ./config-server
         run: |
           mvn package -DskipTests=true \
             -Dmaven.javadoc.skip=true \
             -B
+
+      - name: Extract service name
+        id: service
+        run: |
+          # Extract service name from repository name
+          REPO_NAME="${{ github.repository }}"
+          SERVICE_NAME=$(echo "$REPO_NAME" | sed 's/.*cloudinsight-\(.*\)-rw/\1/')
+          echo "name=$SERVICE_NAME" >> $GITHUB_OUTPUT
 
       - name: Log in to Container Registry
         if: github.event_name != 'pull_request'
@@ -94,7 +65,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_PREFIX }}-config-server
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_PREFIX }}-${{ steps.service.outputs.name }}
           tags: |
             type=ref,event=branch
             type=ref,event=pr
@@ -105,7 +76,7 @@ jobs:
         if: github.event_name != 'pull_request'
         uses: docker/build-push-action@v5
         with:
-          context: ./config-server
+          context: .
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
