@@ -1,4 +1,0 @@
-SPRING_APPLICATION_NAME=cloudinsight-config-server
-SPRING_CLOUD_CONFIG_SERVER_GIT_URI=https://github.com/AmaliTech-Training-Academy/cloudinsight-config-repo-rw.git
-SPRING_CLOUD_CONFIG_SERVER_GIT_DEFAULT_LABEL=main
-SERVER_PORT=8000
