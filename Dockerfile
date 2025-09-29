@@ -15,37 +15,41 @@ COPY src ./src/
 RUN mvn package -DskipTests
 
 # Runtime stage: Setup the actual runtime environment
-FROM bellsoft/liberica-openjre-debian:21-cds
+# Using Eclipse Temurin distroless - optimized for microservices with minimal attack surface
+FROM eclipse-temurin:21-jre-jammy
 
 # Add metadata
 LABEL maintainer="AmaliTech Training Academy" \
-    description="Cloud Insight Pro Project" \
+    description="Cloud Insight Pro Config Server" \
     version="1.0"
 
-# Install jq for JSON processing in entrypoint script
-RUN apt-get update && apt-get install -y jq && apt-get clean && rm -rf /var/lib/apt/lists/*
+# Install jq for JSON processing and clean up in same layer
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends jq && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
 # Set default environment variables (can be overridden)
 ENV SPRING_PROFILES_ACTIVE=production
 ENV SERVER_PORT=8085
 
-# Create a non-root user
-RUN useradd -r -u 1001 -g root userservice
+# Create a non-root user for security
+RUN groupadd -r -g 1001 userservice && \
+    useradd -r -u 1001 -g userservice userservice
 
 WORKDIR /application
 
 # Copy the extracted layers from the build stage
-COPY --from=builder --chown=userservice:root /build/target/*.jar ./application.jar
+COPY --from=builder --chown=userservice:userservice /build/target/*.jar ./application.jar
 
-# Copy entrypoint script
-COPY --chown=userservice:root entrypoint.sh ./entrypoint.sh
+# Copy the entrypoint script
+COPY --chown=userservice:userservice entrypoint.sh ./entrypoint.sh
 
-# Set executable permissions for entrypoint
-RUN chmod +x ./entrypoint.sh
+RUN chmod +x /application/entrypoint.sh
 
 # Configure container
 USER 1001
 EXPOSE 8085
 
-# Use entrypoint script that sources environment and starts the application
-ENTRYPOINT ["bash", "-c", "source ./entrypoint.sh && exec java -XX:+UseContainerSupport -XX:MaxRAMPercentage=75.0 -Djava.security.egd=file:/dev/./urandom -jar application.jar"]
+# Use entrypoint script before launching the application
+ENTRYPOINT ["/bin/bash", "-c", "source ./entrypoint.sh && java -XX:+UseContainerSupport -XX:MaxRAMPercentage=75.0 -Djava.security.egd=file:/dev/./urandom -jar application.jar"]
