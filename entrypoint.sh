@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Production-ready entrypoint script for config-server
+# Production-ready entrypoint script for config-server.
 ENV_JSON_FILE="/mnt/secrets/config-server-env.json"
 
 # List of environment variables to ignore (already hardcoded in deployment)
